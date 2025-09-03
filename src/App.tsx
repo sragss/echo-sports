@@ -4,6 +4,8 @@ import AIComponent from './AIComponent';
 function App() {
   const { isAuthenticated, user, balance, signOut } = useEcho();
 
+  console.log(balance);
+
   if (!isAuthenticated) {
     return (
       <div className="min-h-screen bg-gray-50 flex items-center justify-center">

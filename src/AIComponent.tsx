@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { generateText } from 'ai';
+import { streamText } from 'ai';
 import { anthropic } from '@ai-sdk/anthropic';
 import { useEchoModelProviders } from '@merit-systems/echo-react-sdk';
 
@@ -20,23 +20,84 @@ type SportsNews = {
   barTalk: string[];
 };
 
+// Lazy JSON parser that attempts to parse partial JSON
+const tryParsePartialJSON = (text: string): Partial<SportsNews> | null => {
+  // Try parsing complete JSON first
+  try {
+    return JSON.parse(text);
+  } catch {
+    // If that fails, try to extract and parse partial structures
+    try {
+      // Try to extract summary
+      const summaryMatch = text.match(/"summary"\s*:\s*"([^"]*(?:\\.[^"]*)*)"/);
+      const summary = summaryMatch ? summaryMatch[1].replace(/\\"/g, '"') : undefined;
+
+      // Try to extract events array (even if incomplete)
+      const eventsMatch = text.match(/"events"\s*:\s*\[([\s\S]*?)(?:\]|$)/);
+      let events: SportsEvent[] = [];
+      
+      if (eventsMatch) {
+        const eventsStr = eventsMatch[1];
+        // Split by complete event objects
+        const eventMatches = eventsStr.match(/\{[^}]*"headline"[^}]*\}/g) || [];
+        events = eventMatches.map(eventStr => {
+          try {
+            return JSON.parse(eventStr);
+          } catch {
+            // Extract individual fields manually if JSON parsing fails
+            const categoryMatch = eventStr.match(/"category"\s*:\s*"([^"]*)"/);
+            const headlineMatch = eventStr.match(/"headline"\s*:\s*"([^"]*(?:\\.[^"]*)*)"/);
+            const descriptionMatch = eventStr.match(/"description"\s*:\s*"([^"]*(?:\\.[^"]*)*)"/);
+            const significanceMatch = eventStr.match(/"significance"\s*:\s*"([^"]*)"/);
+            
+            return {
+              category: categoryMatch?.[1] || 'Other',
+              headline: headlineMatch?.[1].replace(/\\"/g, '"') || 'Loading...',
+              description: descriptionMatch?.[1].replace(/\\"/g, '"') || 'Loading...',
+              significance: (significanceMatch?.[1] as 'High' | 'Medium' | 'Low') || 'Medium',
+            } as SportsEvent;
+          }
+        }).filter(event => event.headline !== 'Loading...');
+      }
+
+      // Try to extract barTalk array
+      const barTalkMatch = text.match(/"barTalk"\s*:\s*\[([\s\S]*?)(?:\]|$)/);
+      let barTalk: string[] = [];
+      
+      if (barTalkMatch) {
+        const barTalkStr = barTalkMatch[1];
+        const talkMatches = barTalkStr.match(/"([^"]*(?:\\.[^"]*)*)"/g) || [];
+        barTalk = talkMatches.map(match => match.slice(1, -1).replace(/\\"/g, '"'));
+      }
+
+      return { summary, events, barTalk };
+    } catch {
+      return null;
+    }
+  }
+};
+
 export default function AIComponent() { 
     const [sportsNews, setSportsNews] = useState<SportsNews | null>(null);
+    const [partialData, setPartialData] = useState<Partial<SportsNews> | null>(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [streamingText, setStreamingText] = useState<string>('');
     const { anthropic: echoAnthropic } = useEchoModelProviders();
 
     const handleSportsSearch = async () => {
         setLoading(true);
         setError(null);
         setSportsNews(null);
+        setPartialData(null);
+        setStreamingText('');
         
         try {
             const webSearchTool = anthropic.tools.webSearch_20250305({
                 maxUses: 5,
             });
 
-            const { text } = await generateText({
+            const { textStream } = await streamText({
                 model: await echoAnthropic('claude-sonnet-4-20250514'),
                 prompt: `Search for the latest US sports news and events from the past week. Focus on major leagues like NFL, NBA, MLB, NHL, college sports, and other significant sporting events.
 
@@ -63,32 +124,45 @@ After searching, provide your response in the following JSON format ONLY (no oth
   ]
 }
 
-Make sure none of the bar talk is longer than 20 words. Be aggressive like a 20-year-old would talk.
+CONTENT REQUIREMENTS:
+- Headlines: Make them SHARP and attention-grabbing, like a great sports Twitter account
+- Descriptions: Pack them with context, drama, stakes, and why people care. Include specific stats, money involved, career implications, historical context
+- Bar Talk: 15 words max, SAVAGE and quotable. Think Pat McAfee meets Barstool. Include specific names, numbers, comparisons
 
-IMPORTANT: For each event, include 1-3 relevant links to reputable sources (ESPN, CBS Sports, The Athletic, etc.) that provide more details about the story. These should be actual URLs from your web search results.
+SEARCH CONSTRAINTS: 
+- Only TOP 3 events (quality over quantity)
+- Do NO MORE THAN 4 searches total
+- Focus on stories with DRAMA, MONEY, CONTROVERSY, or HISTORIC significance
+- Include actual betting lines, contract values, or career stats when relevant
 
-Only provide TOP 4 events. No more.
-
-Focus on the most culturally significant and newsworthy events. For barTalk, create witty, quotable comments that mix sports insight with humor - the kind of things that would make you sound smart and funny when talking sports with friends. Include references to recent drama, upsets, or cultural moments.`,
+Make every sentence dense with information and personality. This should read like the smartest, funniest sports analyst you know wrote it after 3 beers.`,
                 tools: {
                     web_search: webSearchTool,
                 },
             });
+
+            let accumulatedText = '';
             
-            // Parse the JSON response
-            try {
-                const parsedData = JSON.parse(text) as SportsNews;
-                setSportsNews(parsedData);
-            } catch (parseError) {
-                // If JSON parsing fails, try to extract JSON from the text
-                const jsonMatch = text.match(/\{[\s\S]*\}/);
-                if (jsonMatch) {
-                    const parsedData = JSON.parse(jsonMatch[0]) as SportsNews;
-                    setSportsNews(parsedData);
-                } else {
-                    throw new Error('Failed to parse structured response');
+            for await (const chunk of textStream) {
+                accumulatedText += chunk;
+                setStreamingText(accumulatedText);
+                
+                // Try to parse partial JSON as we stream
+                const partialParsed = tryParsePartialJSON(accumulatedText);
+                if (partialParsed) {
+                    setPartialData(partialParsed);
                 }
             }
+            
+            // Final parsing attempt
+            const finalParsed = tryParsePartialJSON(accumulatedText);
+            if (finalParsed && finalParsed.summary && finalParsed.events && finalParsed.barTalk) {
+                setSportsNews(finalParsed as SportsNews);
+                setPartialData(null);
+            } else {
+                throw new Error('Failed to parse complete structured response');
+            }
+            
         } catch (error) {
             if (error instanceof Error && error.message.includes('Web search failed')) {
                 setError('Web search error: ' + error.message);
@@ -160,19 +234,43 @@ Focus on the most culturally significant and newsworthy events. For barTalk, cre
                     </div>
                 )}
 
-                {sportsNews && (
+                {/* Show streaming status */}
+                {loading && !partialData && (
+                    <div className="bg-white border border-gray-200 shadow-sm">
+                        <div className="border-l-4 border-gray-400 p-8">
+                            <div className="flex items-center mb-4">
+                                <div className="w-1 h-1 bg-gray-400 mr-3"></div>
+                                <h2 className="text-lg font-medium text-gray-900 tracking-wider uppercase">
+                                    Generating Intelligence Report
+                                </h2>
+                            </div>
+                            <div className="flex items-center space-x-3">
+                                <div className="animate-spin w-4 h-4 border-2 border-gray-300 border-t-black"></div>
+                                <p className="text-gray-600 font-light">
+                                    Searching sports databases and analyzing cultural significance...
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* Show partial data while streaming */}
+                {(partialData || sportsNews) && (
                     <div className="space-y-12">
                         {/* Executive Summary */}
                         <section className="bg-white border border-gray-200 shadow-sm">
-                            <div className="border-l-4 border-black p-8">
+                            <div className={`border-l-4 p-8 ${loading ? 'border-gray-400' : 'border-black'}`}>
                                 <div className="flex items-center mb-4">
-                                    <div className="w-1 h-1 bg-black mr-3"></div>
+                                    <div className={`w-1 h-1 mr-3 ${loading ? 'bg-gray-400' : 'bg-black'}`}></div>
                                     <h2 className="text-lg font-medium text-gray-900 tracking-wider uppercase">
                                         Executive Summary
                                     </h2>
+                                    {loading && (
+                                        <div className="ml-3 animate-spin w-3 h-3 border border-gray-300 border-t-black"></div>
+                                    )}
                                 </div>
                                 <p className="text-gray-600 leading-relaxed text-lg font-light">
-                                    {sportsNews.summary}
+                                    {(sportsNews?.summary || partialData?.summary) || (loading ? 'Analyzing current sports landscape...' : '')}
                                 </p>
                             </div>
                         </section>
@@ -180,7 +278,7 @@ Focus on the most culturally significant and newsworthy events. For barTalk, cre
                         {/* Events Grid */}
                         <section>
                             <div className="grid gap-8 md:grid-cols-2 xl:grid-cols-3">
-                                {sportsNews.events
+                                {(sportsNews?.events || partialData?.events || [])
                                     .sort((a, b) => {
                                         const significanceOrder = { High: 3, Medium: 2, Low: 1 };
                                         return significanceOrder[b.significance] - significanceOrder[a.significance];
@@ -280,7 +378,7 @@ Focus on the most culturally significant and newsworthy events. For barTalk, cre
                         </section>
 
                         {/* Bar Talk Section */}
-                        {sportsNews.barTalk && sportsNews.barTalk.length > 0 && (
+                        {((sportsNews?.barTalk && sportsNews.barTalk.length > 0) || (partialData?.barTalk && partialData.barTalk.length > 0)) && (
                             <section className="bg-black text-white">
                                 <div className="p-8">
                                     <div className="flex items-center mb-6">
@@ -294,7 +392,7 @@ Focus on the most culturally significant and newsworthy events. For barTalk, cre
                                     </div>
                                     
                                     <div className="space-y-4">
-                                        {sportsNews.barTalk.map((comment, index) => (
+                                        {(sportsNews?.barTalk || partialData?.barTalk || []).map((comment, index) => (
                                             <div 
                                                 key={index}
                                                 className="group cursor-pointer hover:bg-gray-900 transition-colors duration-200 p-4 border-l border-gray-800 hover:border-white"
