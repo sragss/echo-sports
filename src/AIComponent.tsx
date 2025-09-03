@@ -82,7 +82,6 @@ export default function AIComponent() {
     const [partialData, setPartialData] = useState<Partial<SportsNews> | null>(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
-    const [streamingText, setStreamingText] = useState<string>('');
     const { anthropic: echoAnthropic } = useEchoModelProviders();
 
     const handleSportsSearch = async () => {
@@ -90,7 +89,6 @@ export default function AIComponent() {
         setError(null);
         setSportsNews(null);
         setPartialData(null);
-        setStreamingText('');
         
         try {
             const webSearchTool = anthropic.tools.webSearch_20250305({
@@ -145,7 +143,6 @@ Make every sentence dense with information and personality. This should read lik
             
             for await (const chunk of textStream) {
                 accumulatedText += chunk;
-                setStreamingText(accumulatedText);
                 
                 // Try to parse partial JSON as we stream
                 const partialParsed = tryParsePartialJSON(accumulatedText);
